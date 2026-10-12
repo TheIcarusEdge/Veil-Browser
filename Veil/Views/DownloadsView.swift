@@ -1,11 +1,36 @@
 import AVKit
+import CoreTransferable
 import Photos
+import PhotosUI
+import QuickLook
 import SwiftUI
+import UniformTypeIdentifiers
+
+/// A video passed in from Photos or dropped onto Veil. Copied into Documents/Imports.
+struct ImportedMovie: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(contentType: .movie) { movie in
+            SentTransferredFile(movie.url)
+        } importing: { received in
+            ImportedMovie(url: try DownloadManager.importFile(from: received.file))
+        }
+    }
+}
 
 struct DownloadsView: View {
     @ObservedObject private var manager = DownloadManager.shared
     @Environment(\.dismiss) private var dismiss
     @State private var edits: [URL] = []
+    @State private var imports: [URL] = []
+    @State private var showFilePicker = false
+    @State private var showPhotoPicker = false
+    @State private var photoItems: [PhotosPickerItem] = []
+    @State private var openFile: URL?
+    @State private var preview: URL?
+    @State private var importError: String?
+    @State private var importing = false
 
     var body: some View {
         NavigationStack {
@@ -15,10 +40,37 @@ struct DownloadsView: View {
                         Text("Nothing downloaded yet.").foregroundStyle(.secondary)
                     }
                     ForEach(manager.items) { item in
-                        DownloadRow(item: item)
+                        DownloadRow(item: item) { preview = $0 }
                     }
                     .onDelete { offsets in
                         offsets.map { manager.items[$0] }.forEach(manager.remove)
+                    }
+                }
+
+                Section {
+                    if imports.isEmpty {
+                        Text("Add a video from Files or Photos with the plus button, or share one to Veil from another app.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(imports, id: \.self) { url in
+                        NavigationLink {
+                            EditorView(fileURL: url)
+                        } label: {
+                            Label(url.lastPathComponent, systemImage: "square.and.arrow.down.on.square")
+                        }
+                    }
+                    .onDelete { offsets in
+                        for i in offsets { try? FileManager.default.removeItem(at: imports[i]) }
+                        loadFiles()
+                    }
+                } header: {
+                    Text("Imported")
+                } footer: {
+                    if importing {
+                        Text("Importing...")
+                    } else if let importError {
+                        Text(importError).foregroundStyle(.red)
                     }
                 }
 
@@ -33,7 +85,7 @@ struct DownloadsView: View {
                         }
                         .onDelete { offsets in
                             for i in offsets { try? FileManager.default.removeItem(at: edits[i]) }
-                            loadEdits()
+                            loadFiles()
                         }
                     }
                 }
@@ -41,26 +93,100 @@ struct DownloadsView: View {
             .navigationTitle("Downloads")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        Button { showFilePicker = true } label: { Label("Import From Files", systemImage: "folder") }
+                        Button { showPhotoPicker = true } label: { Label("Import From Photos", systemImage: "photo.on.rectangle") }
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
-            .onAppear(perform: loadEdits)
+            .onAppear(perform: loadFiles)
+            .onChange(of: manager.items) { _, _ in loadFiles() }
+            .fileImporter(
+                isPresented: $showFilePicker,
+                allowedContentTypes: [.movie, .video, .audiovisualContent],
+                allowsMultipleSelection: true
+            ) { result in
+                importFiles(result)
+            }
+            .photosPicker(isPresented: $showPhotoPicker, selection: $photoItems, matching: .videos)
+            .onChange(of: photoItems) { _, items in
+                guard !items.isEmpty else { return }
+                importPhotos(items)
+            }
+            .dropDestination(for: ImportedMovie.self) { movies, _ in
+                loadFiles()
+                if let first = movies.first { openFile = first.url }
+                return !movies.isEmpty
+            }
+            .navigationDestination(item: $openFile) { url in
+                EditorView(fileURL: url)
+            }
+            .quickLookPreview($preview)
         }
     }
 
-    private func loadEdits() {
-        let files = (try? FileManager.default.contentsOfDirectory(
-            at: DownloadManager.editsDir, includingPropertiesForKeys: nil
-        )) ?? []
-        edits = files.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    private func loadFiles() {
+        edits = Self.videos(in: DownloadManager.editsDir)
+        // Imports, plus any video someone dropped straight into Veil's folder in the Files app.
+        imports = Self.videos(in: DownloadManager.importsDir) + Self.videos(in: DownloadManager.documentsDir)
+    }
+
+    private static func videos(in dir: URL) -> [URL] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        return files.filter { VideoFiles.isVideo($0) }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private func importFiles(_ result: Result<[URL], Error>) {
+        importError = nil
+        switch result {
+        case .success(let urls):
+            var last: URL?
+            for url in urls {
+                do { last = try DownloadManager.importFile(from: url) } catch { importError = error.localizedDescription }
+            }
+            loadFiles()
+            if urls.count == 1, let last { openFile = last }
+        case .failure(let error):
+            importError = error.localizedDescription
+        }
+    }
+
+    private func importPhotos(_ items: [PhotosPickerItem]) {
+        importing = true
+        importError = nil
+        Task {
+            var last: URL?
+            for item in items {
+                do {
+                    if let movie = try await item.loadTransferable(type: ImportedMovie.self) { last = movie.url }
+                } catch {
+                    importError = "Couldn't import from Photos. \(error.localizedDescription)"
+                }
+            }
+            importing = false
+            photoItems = []
+            loadFiles()
+            if items.count == 1, let last { openFile = last }
+        }
     }
 }
 
 struct DownloadRow: View {
     let item: DownloadItem
+    let preview: (URL) -> Void
 
     var body: some View {
         if item.status == .finished, let url = DownloadManager.shared.fileURL(for: item) {
-            NavigationLink { EditorView(fileURL: url) } label: { details }
+            if item.isVideo {
+                NavigationLink { EditorView(fileURL: url) } label: { details }
+            } else {
+                Button { preview(url) } label: { details }
+                    .foregroundStyle(.primary)
+            }
         } else {
             details
         }
@@ -68,22 +194,39 @@ struct DownloadRow: View {
 
     private var details: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(item.title).lineLimit(2)
+            Label {
+                Text(item.title).lineLimit(2)
+            } icon: {
+                Image(systemName: item.isFile == true ? "doc" : (item.isStream ? "dot.radiowaves.left.and.right" : "film"))
+                    .foregroundStyle(.secondary)
+            }
             switch item.status {
             case .downloading:
                 ProgressView(value: item.progress)
             case .converting:
                 HStack(spacing: 8) {
                     ProgressView()
-                    Text("Converting to MP4").font(.caption).foregroundStyle(.secondary)
+                    Text("Building MP4").font(.caption).foregroundStyle(.secondary)
                 }
             case .finished:
                 Text(item.fileName ?? "").font(.caption).foregroundStyle(.secondary)
             case .failed:
                 Text(item.error ?? "Failed").font(.caption).foregroundStyle(.red)
+                    .textSelection(.enabled)
             }
         }
     }
+}
+
+/// Lets the person pick a folder in the Files app to save a copy into.
+struct SaveToFiles: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        UIDocumentPickerViewController(forExporting: [url], asCopy: true)
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
 }
 
 // MARK: - Editor
@@ -103,6 +246,7 @@ struct EditorView: View {
     @State private var exporting = false
     @State private var exported: URL?
     @State private var message: String?
+    @State private var saveTarget: OpenedFile?
 
     init(fileURL: URL) {
         self.fileURL = fileURL
@@ -175,8 +319,10 @@ struct EditorView: View {
                 if let exported {
                     ShareLink(item: exported) { Label("Share Clip", systemImage: "square.and.arrow.up") }
                     Button { saveToPhotos(exported) } label: { Label("Save to Photos", systemImage: "photo.on.rectangle") }
+                    Button { saveTarget = OpenedFile(url: exported) } label: { Label("Save Clip to Files", systemImage: "folder") }
                 }
                 ShareLink(item: fileURL) { Label("Share Original", systemImage: "square.and.arrow.up.on.square") }
+                Button { saveTarget = OpenedFile(url: fileURL) } label: { Label("Save Original to Files", systemImage: "folder.badge.plus") }
             }
 
             if let message {
@@ -199,6 +345,7 @@ struct EditorView: View {
         .onChange(of: start) { _, value in if value > end { end = value } }
         .onChange(of: end) { _, value in if value < start { start = value } }
         .onDisappear { player.pause() }
+        .sheet(item: $saveTarget) { file in SaveToFiles(url: file.url) }
     }
 
     private var outputSizeText: String {

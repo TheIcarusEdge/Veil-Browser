@@ -8,7 +8,26 @@ struct DetectedVideo: Identifiable, Hashable {
     let pageURL: URL?
     let title: String
 
-    var isStream: Bool { url.absoluteString.lowercased().contains(".m3u8") }
+    /// A hint for the list. The download checks what the link really is.
+    var isStream: Bool {
+        let s = url.absoluteString.lowercased()
+        return s.contains(".m3u8") || s.contains("applehttp") || s.contains("/playmanifest/")
+    }
+}
+
+/// A video the person long-pressed on the page.
+struct PickedVideo: Identifiable {
+    let id = UUID()
+    let address: String
+    let pageURL: URL?
+    let title: String
+
+    var url: URL? {
+        guard let url = URL(string: address), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return nil }
+        return url
+    }
+    /// blob: and MediaSource players hide the real file, so there is nothing to save directly.
+    var isHidden: Bool { address.isEmpty || address.hasPrefix("blob:") }
 }
 
 /// Avoids the retain cycle WKUserContentController creates with its message handlers.
@@ -37,14 +56,20 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     @Published var canGoForward = false
     @Published var videos: [DetectedVideo] = []
     @Published var insecureOffer: URL?
+    @Published var pickedVideo: PickedVideo?
+    /// A small picture of the page for the tab switcher. Kept in memory only.
+    @Published private(set) var snapshot: UIImage?
     /// A restored tab's address. It loads the first time the tab is shown, so a launch
     /// with many saved tabs doesn't load them all at once.
     @Published private(set) var pendingURL: URL?
+    @Published private(set) var blockingOn = false
 
     private var observations: [NSKeyValueObservation] = []
     private var upgradedHosts = Set<String>()
     private var allowedHTTPHosts = Set<String>()
     private var lastUpgrade: (host: String, time: Date)?
+    private var ruleList: WKContentRuleList?
+    private var appliedList: WKContentRuleList?
 
     init(isPrivate: Bool, blockList: WKContentRuleList?) {
         self.isPrivate = isPrivate
@@ -60,7 +85,6 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         ))
-        if let blockList { controller.add(blockList) }
         config.userContentController = controller
 
         webView = WKWebView(frame: .zero, configuration: config)
@@ -71,6 +95,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
         observe()
+        setBlocking(blockList)
 
         if Self.userAgent == nil {
             webView.evaluateJavaScript("navigator.userAgent") { result, _ in
@@ -107,6 +132,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
     func load(_ url: URL) {
         insecureOffer = nil
         pendingURL = nil
+        updateBlocking(for: url.host)
         webView.load(URLRequest(url: url))
     }
 
@@ -122,12 +148,6 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         if let pending = pendingURL { load(pending) }
     }
 
-    func setBlocking(_ list: WKContentRuleList?) {
-        let controller = webView.configuration.userContentController
-        controller.removeAllContentRuleLists()
-        if let list { controller.add(list) }
-    }
-
     func allowInsecure() {
         guard let offer = insecureOffer, let host = offer.host else { return }
         allowedHTTPHosts.insert(host)
@@ -135,20 +155,63 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
         webView.load(URLRequest(url: offer))
     }
 
-    /// Passes the page's own cookies along as a header so the download works on sites
-    /// that need a login, without copying those cookies anywhere they would persist.
+    /// Takes a small picture of the page for the tab switcher. Only works while the tab is on screen.
+    func captureSnapshot() {
+        guard webView.window != nil, url != nil else { return }
+        let config = WKSnapshotConfiguration()
+        config.snapshotWidth = 360
+        webView.takeSnapshot(with: config) { [weak self] image, _ in
+            if let image { self?.snapshot = image }
+        }
+    }
+
+    // MARK: Ad Blocking
+
+    func setBlocking(_ list: WKContentRuleList?) {
+        ruleList = list
+        updateBlocking(for: webView.url?.host ?? pendingURL?.host)
+    }
+
+    /// Turns the rules on or off for the site being loaded, honoring sites where blocking is off.
+    func updateBlocking(for host: String?) {
+        let target = AppSettings.isBlockingOff(for: host) ? nil : ruleList
+        guard target !== appliedList else { return }
+        let controller = webView.configuration.userContentController
+        controller.removeAllContentRuleLists()
+        if let target { controller.add(target) }
+        appliedList = target
+        blockingOn = target != nil
+    }
+
+    var isBlockingOffHere: Bool { AppSettings.isBlockingOff(for: url?.host) }
+
+    func toggleBlockingHere() {
+        guard let host = url?.host else { return }
+        AppSettings.setBlockingOff(!isBlockingOffHere, for: host)
+        updateBlocking(for: host)
+        webView.reload()
+    }
+
+    // MARK: Downloads
+
+    /// Passes the page's cookies to the downloader, which attaches only the ones each request
+    /// needs. Nothing is copied anywhere it would persist.
     func download(_ video: DetectedVideo) {
         webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
-            let host = video.url.host ?? ""
-            let matching = cookies.filter { cookie in
-                let domain = cookie.domain.hasPrefix(".") ? String(cookie.domain.dropFirst()) : cookie.domain
-                return host == domain || host.hasSuffix("." + domain)
-            }
-            var headers = HTTPCookie.requestHeaderFields(with: matching)
-            if let page = video.pageURL { headers["Referer"] = page.absoluteString }
-            if let agent = BrowserTab.userAgent { headers["User-Agent"] = agent }
-            DownloadManager.shared.start(video, headers: headers)
+            DownloadManager.shared.start(
+                video,
+                cookies: cookies,
+                referer: video.pageURL,
+                userAgent: BrowserTab.userAgent
+            )
         }
+    }
+
+    func download(_ picked: PickedVideo) {
+        guard let url = picked.url else { return }
+        let title = picked.title.isEmpty ? url.lastPathComponent : picked.title
+        let video = videos.first { $0.url == url } ?? DetectedVideo(url: url, pageURL: picked.pageURL, title: title)
+        download(video)
     }
 
     fileprivate func addVideo(url: URL, page: URL?, title: String) {
@@ -156,6 +219,12 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable {
               !videos.contains(where: { $0.url == url }) else { return }
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
         videos.append(DetectedVideo(url: url, pageURL: page, title: clean.isEmpty ? url.lastPathComponent : clean))
+    }
+
+    private static func isAttachment(_ response: URLResponse) -> Bool {
+        guard let http = response as? HTTPURLResponse,
+              let disposition = http.value(forHTTPHeaderField: "Content-Disposition") else { return false }
+        return disposition.lowercased().hasPrefix("attachment")
     }
 }
 
@@ -169,6 +238,12 @@ extension BrowserTab: WKNavigationDelegate {
     ) {
         guard let url = action.request.url, let scheme = url.scheme?.lowercased() else {
             decisionHandler(.allow)
+            return
+        }
+
+        // Links marked as downloads (<a download>) save to Downloads.
+        if action.shouldPerformDownload {
+            decisionHandler(.download)
             return
         }
 
@@ -203,6 +278,9 @@ extension BrowserTab: WKNavigationDelegate {
             return
         }
 
+        if action.targetFrame?.isMainFrame ?? true {
+            updateBlocking(for: url.host)
+        }
         decisionHandler(.allow)
     }
 
@@ -218,13 +296,36 @@ extension BrowserTab: WKNavigationDelegate {
                 decisionHandler(.cancel)
                 return
             }
+        } else if Self.isAttachment(response.response) || !response.canShowMIMEType {
+            // PDFs show in the page. Anything else the page can't show (or marks as an
+            // attachment) is saved to Downloads.
+            decisionHandler(.download)
+            return
         }
         decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        WebDownload.begin(download)
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        WebDownload.begin(download)
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         videos = []
         insecureOffer = nil
+        pickedVideo = nil
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if !isPrivate, let url = webView.url {
+            HistoryStore.shared.record(url: url, title: webView.title ?? "")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.captureSnapshot()
+        }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -254,11 +355,18 @@ extension BrowserTab: WKUIDelegate {
 
 extension BrowserTab: WKScriptMessageHandler {
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let body = message.body as? [String: Any],
-              let raw = body["url"] as? String,
-              let url = URL(string: raw) else { return }
+        guard let body = message.body as? [String: Any] else { return }
+        let raw = (body["url"] as? String) ?? ""
         let page = (body["page"] as? String).flatMap { URL(string: $0) }
         let title = (body["title"] as? String) ?? ""
+
+        if (body["kind"] as? String) == "pick" {
+            let picked = PickedVideo(address: raw, pageURL: page, title: title)
+            if let url = picked.url { addVideo(url: url, page: page, title: title) }
+            pickedVideo = picked
+            return
+        }
+        guard let url = URL(string: raw) else { return }
         addVideo(url: url, page: page, title: title)
     }
 }

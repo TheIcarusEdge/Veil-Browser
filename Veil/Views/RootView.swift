@@ -17,6 +17,18 @@ struct RootView: View {
                 PrivateLockView(locked: store.privateLocked)
             }
         }
+        // Videos shared to Veil from another app or opened from the Files app.
+        .onOpenURL { url in store.open(fileFrom: url) }
+        .sheet(item: $store.openedFile) { file in
+            NavigationStack {
+                EditorView(fileURL: file.url)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { store.openedFile = nil }
+                        }
+                    }
+            }
+        }
         .onChange(of: phase) { _, newPhase in
             switch newPhase {
             case .inactive:

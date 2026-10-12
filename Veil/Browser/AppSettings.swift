@@ -38,11 +38,41 @@ enum AppSettings {
             "lockPrivateTabs": true,
             "clearOnBackground": false,
             "restoreTabs": true,
+            "saveHistory": false,
         ])
     }
 
     static var blockTrackers: Bool { UserDefaults.standard.bool(forKey: "blockTrackers") }
     static var restoreTabs: Bool { UserDefaults.standard.bool(forKey: "restoreTabs") }
+    static var saveHistory: Bool { UserDefaults.standard.bool(forKey: "saveHistory") }
+
+    // MARK: Sites with ad blocking turned off
+
+    private static let blockingOffKey = "blockingOffHosts"
+
+    static var blockingOffHosts: Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: blockingOffKey) ?? [])
+    }
+
+    /// Matches the site and its subdomains, ignoring a leading "www.".
+    static func isBlockingOff(for host: String?) -> Bool {
+        guard let host = host?.lowercased() else { return false }
+        return blockingOffHosts.contains { off in host == off || host.hasSuffix("." + off) }
+    }
+
+    static func setBlockingOff(_ off: Bool, for host: String) {
+        let site = siteName(host)
+        var hosts = blockingOffHosts
+        if off { hosts.insert(site) } else {
+            hosts = hosts.filter { !(site == $0 || site.hasSuffix("." + $0)) }
+        }
+        UserDefaults.standard.set(hosts.sorted(), forKey: blockingOffKey)
+    }
+
+    static func siteName(_ host: String) -> String {
+        let h = host.lowercased()
+        return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
+    }
 
     // Saved normal tabs. Private tabs are never written here.
     static let savedTabsKey = "savedTabs"

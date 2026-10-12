@@ -2,10 +2,17 @@ import Foundation
 import LocalAuthentication
 import WebKit
 
+/// A video handed to Veil by another app or the Files app, waiting to open in the editor.
+struct OpenedFile: Identifiable {
+    let url: URL
+    var id: URL { url }
+}
+
 final class TabStore: ObservableObject {
     @Published private(set) var tabs: [BrowserTab] = []
     @Published var currentID: UUID?
     @Published var privateLocked = false
+    @Published var openedFile: OpenedFile?
 
     private var blockList: WKContentRuleList?
 
@@ -75,6 +82,17 @@ final class TabStore: ObservableObject {
         let index = min(max(UserDefaults.standard.integer(forKey: AppSettings.savedTabIndexKey), 0), tabs.count - 1)
         select(tabs[index])
         return true
+    }
+
+    /// Imports a video another app sent to Veil and opens it in the editor.
+    func open(fileFrom url: URL) {
+        guard url.isFileURL else { return }
+        do {
+            let local = try DownloadManager.importFile(from: url)
+            openedFile = OpenedFile(url: local)
+        } catch {
+            print("Couldn't import \(url.lastPathComponent): \(error)")
+        }
     }
 
     func close(_ tab: BrowserTab) {
