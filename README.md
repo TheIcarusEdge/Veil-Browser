@@ -1,28 +1,33 @@
 # Veil
 
-A privacy-focused iOS browser with video downloading and basic editing. Version 0.1.3. "Veil" is a placeholder name.
+A privacy-focused iOS browser with video downloading and basic editing. Version 0.2.0. "Veil" is a placeholder name.
 
-## What Version 1 Does
+## What It Does
 
 **Browsing and Privacy**
-- Tabs and private tabs. Each private tab gets its own throwaway storage, so its cookies and site data vanish when you close it.
-- Blocks 59 tracker and ad networks through Apple's built-in content blocker.
+- Tabs and private tabs. New tabs follow the mode you're in. The tab switcher shows a preview of each page.
+- Each private tab gets its own throwaway storage, so its cookies and site data vanish when you close it.
+- Blocks about 6,500 ad and tracking networks and hides common ad slots. Turn it off for one site from the menu if something breaks.
 - HTTPS Only mode upgrades plain http pages and warns before loading a site that has no secure version.
 - Private tabs lock with Face ID when you leave the app and are hidden from the app switcher.
-- No history, no analytics, no accounts. Search defaults to DuckDuckGo.
-- Normal tabs reopen when you relaunch the app (Settings > Reopen Tabs on Launch). Private tabs are never saved. Settings always stay as you set them.
+- History is off by default. Turn it on in Settings to keep one for normal tabs. Private tabs are never recorded.
+- Normal tabs reopen when you relaunch the app (Settings > Reopen Tabs on Launch).
+- No analytics, no accounts. Search defaults to DuckDuckGo.
 
 **Downloading**
-- Detects video files a page loads. A badge on the download button shows how many it found.
+- Detects videos a page loads. A badge on the download button shows how many it found.
+- Press and hold a video on the page to download that exact video or copy its address.
 - Plain video files (MP4, MOV, WebM) download in the background.
-- Streamed video (HLS) downloads and converts to MP4. This part is experimental.
+- Streamed video (HLS) downloads with Veil's own stream downloader. It uses your login on the site, so videos behind a login (like Canvas) work, and it builds an MP4 without re-encoding.
+- Other files a page offers (PDFs, documents, attachments) save to Downloads too.
 - Files appear in the Files app under On My iPhone > Veil.
 - DRM-protected video and blob streams can't be downloaded.
 
 **Editing**
+- Edit downloads, or bring in videos from Files, Photos, or another app's share sheet.
 - Trim start and end, remove audio, change speed (0.5x to 2x).
-- Crop to 1:1, 9:16, 16:9 or 4:5, slide the crop to the part you want, and see it outlined on the preview before exporting.
-- Export to MP4, share, or save to Photos.
+- Crop to 1:1, 9:16, 16:9 or 4:5, slide the crop to the part you want, and see it outlined on the preview.
+- Export to MP4, share, save to Photos, or save to Files.
 
 ## Build It Without a Mac
 
@@ -53,6 +58,7 @@ The code hasn't been compiled yet. Open the failed run and click the Show Errors
 | `.github/workflows/build.yml` | The cloud Mac build. |
 | `Veil/App` | App entry point. |
 | `Veil/Browser` | Tabs, web views, settings, tracker blocking, video detection. |
-| `Veil/Downloads` | Download manager and the video exporter. |
+| `Veil/Downloads` | Download manager, stream downloader (HLS, TS to MP4), and the video exporter. |
 | `Veil/Views` | Every screen. |
-| `Veil/Resources/blocklist.json` | Tracker and ad rules. |
+| `Veil/Resources/blocklist.json` | Ad and tracker rules, built by `tools/build_blocklist.py`. |
+| `Veil/Resources/Assets.xcassets` | App icon, drawn by `tools/draw_icon.py`. |
