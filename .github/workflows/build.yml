@@ -33,10 +33,24 @@ jobs:
             build 2>&1 | tee build.log
 
       # On failure, this step lists only the error lines so they're easy to copy.
+      # Each one also becomes a GitHub annotation, which Claude can read through the API.
       - name: Show Errors
         if: failure()
         run: |
-          grep -E "error:" build.log | sort -u | head -60 || echo "No error lines found. Check the full log."
+          grep -E "error:" build.log | sort -u | head -60 > errors.txt || true
+          if [ ! -s errors.txt ]; then echo "No error lines found. Check the full log."; exit 0; fi
+          cat errors.txt
+          # GitHub keeps at most 10 annotations per step, so the full list also goes in one combined annotation.
+          all=$(python3 -c "import os; t=open('errors.txt').read().replace(os.getcwd()+'/', ''); print(t.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))")
+          echo "::error title=All build errors::${all}"
+          head -9 errors.txt | while IFS= read -r line; do
+            if [[ "$line" =~ ^(/[^:]+):([0-9]+):([0-9]+):\ error:\ (.*)$ ]]; then
+              file="${BASH_REMATCH[1]#$PWD/}"
+              echo "::error file=${file},line=${BASH_REMATCH[2]},col=${BASH_REMATCH[3]}::${BASH_REMATCH[4]}"
+            else
+              echo "::error::${line}"
+            fi
+          done
 
       - name: Upload Build Log
         if: failure()
