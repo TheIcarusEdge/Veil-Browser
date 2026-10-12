@@ -215,11 +215,38 @@ final class TSRemuxer {
     private var audioLeftover = Data()
     private var nextAudioPTS: Int64?
 
-    private var videoClock = Unwrapper()
-    private var audioClock = Unwrapper()
-    private var shift: Int64 = 0
-    private var discontinuityPending = false
-    private var latest: Int64 = 0
+    /// Keeps one track's timeline continuous across stream discontinuities.
+    private struct Timeline {
+        var clock = Unwrapper()
+        var shift: Int64 = 0
+        var pending = false
+        var latest: Int64?
+
+        mutating func mark() {
+            pending = true
+            clock.reset()
+        }
+
+        mutating func adjust(_ raw: Int64, step: Int64) -> Int64 {
+            let t = clock.unwrap(raw)
+            if pending {
+                pending = false
+                if let latest, abs(t + shift - latest) > 180_000 {  // more than 2 seconds away
+                    shift = latest + step - t
+                }
+            }
+            let value = t + shift
+            latest = max(latest ?? value, value)
+            return value
+        }
+    }
+
+    private var videoTime = Timeline()
+    private var audioTime = Timeline()
+    private var lastVideoDTS: Int64?
+    private var lastAudioEnd: Int64?
+    private var firstSPS: Data?
+    private var started = false
     private var base: Int64 = 0
 
     init(output: URL) {
@@ -228,34 +255,27 @@ final class TSRemuxer {
 
     var hasVideoQueued: Bool { !videoQueue.isEmpty }
     var hasAudioQueued: Bool { !audioQueue.isEmpty }
-    var queuedCount: Int { videoQueue.count + audioQueue.count }
+    var queuedCount: Int { (videoActive ? videoQueue.count : 0) + (audioActive ? audioQueue.count : 0) }
     var videoActive: Bool { videoInput != nil && !videoDone }
     var audioActive: Bool { audioInput != nil && !audioDone }
 
     // MARK: Input
 
-    /// The next packets jump in time (an ad break or a re-encoded section). Keeps the timeline continuous.
-    func markDiscontinuity() {
-        discontinuityPending = true
-        videoClock.reset()
-        audioClock.reset()
+    /// The next video packets jump in time (an ad break or a re-encoded section).
+    /// Call after flushing the demuxer, so the jump applies to the new packets only.
+    func markVideoDiscontinuity() {
+        videoTime.mark()
     }
 
-    private func adjust(_ t: Int64) -> Int64 {
-        if discontinuityPending {
-            discontinuityPending = false
-            let shifted = t + shift
-            if abs(shifted - latest) > 180_000 {  // more than 2 seconds away
-                shift += (latest + 3003) - shifted
-            }
-        }
-        let value = t + shift
-        latest = max(latest, value)
-        return value
+    func markAudioDiscontinuity() {
+        audioTime.mark()
+        audioLeftover = Data()
+        nextAudioPTS = nil
     }
 
     func handleVideo(_ payload: Data, pts rawPTS: Int64, dts rawDTS: Int64) {
-        let dts = adjust(videoClock.unwrap(rawDTS))
+        if started && videoInput == nil { return }  // no video track in the file
+        let dts = videoTime.adjust(rawDTS, step: lastVideoDuration)
         let pts = max(dts, rawPTS - rawDTS + dts)
 
         var sample = Data()
@@ -273,13 +293,21 @@ final class TSRemuxer {
                 sample.append(nal)
             }
         }
-        if videoFormat == nil, let sps, let pps { videoFormat = Self.makeVideoFormat(sps: sps, pps: pps) }
+        if videoFormat == nil, let sps, let pps {
+            videoFormat = Self.makeVideoFormat(sps: sps, pps: pps)
+            firstSPS = sps
+        }
         guard videoFormat != nil, !sample.isEmpty else { return }
+        // A section encoded at a different size (often an ad) can't share this track. Skip it.
+        if let firstSPS, let sps, sps != firstSPS { return }
+        // Decode times must keep increasing.
+        if let last = lastVideoDTS, dts <= last { return }
         if !seenKeyframe {
             guard key else { return }
             seenKeyframe = true
         }
 
+        lastVideoDTS = dts
         let frame = VideoFrame(data: sample, pts: pts, dts: dts, key: key, duration: 0)
         if var held = heldVideo {
             let gap = dts - held.dts
@@ -291,13 +319,16 @@ final class TSRemuxer {
     }
 
     func handleAudio(_ payload: Data, pts rawPTS: Int64?) {
+        if started && audioInput == nil { return }  // no audio track in the file
         var t: Int64
         if audioLeftover.isEmpty, let rawPTS {
-            t = adjust(audioClock.unwrap(rawPTS))
+            t = audioTime.adjust(rawPTS, step: 1024 * 90_000 / sampleRate)
         } else if let next = nextAudioPTS {
             t = next
+        } else if lastAudioEnd == nil {
+            t = 0  // the very first audio has no timestamp: start at zero
         } else {
-            return  // no timestamp yet to anchor this audio
+            return
         }
 
         let buffer = audioLeftover + payload
@@ -332,8 +363,16 @@ final class TSRemuxer {
                 audioFormat = Self.makeAudioFormat(objectType: objectType, sampleRate: rates[rateIndex], channels: channels)
             }
 
+            let step = 1024 * 90_000 / sampleRate
+            // Drop audio that would overlap what's already queued.
+            if let end = lastAudioEnd, t < end {
+                t += step
+                i += frameLength
+                continue
+            }
             audioQueue.append(AudioFrame(data: Data(bytes[(i + headerLength)..<(i + frameLength)]), pts: t))
-            t += 1024 * 90_000 / sampleRate
+            lastAudioEnd = t + step
+            t += step
             i += frameLength
         }
         if i < n { audioLeftover = Data(bytes[i..<n]) }
@@ -398,6 +437,7 @@ final class TSRemuxer {
         base = (firstVideo + firstAudio).min() ?? 0
         writer.startSession(atSourceTime: .zero)
         self.writer = writer
+        started = true
 
         if videoInput == nil { videoQueue.removeAll(); heldVideo = nil }
         if audioInput == nil { audioQueue.removeAll() }

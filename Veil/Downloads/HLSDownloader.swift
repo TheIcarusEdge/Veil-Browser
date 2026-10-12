@@ -61,18 +61,19 @@ final class HLSDownloader {
     func run() async throws -> URL {
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
 
-        let firstText = try await text(at: source)
-        var mainURL = source
+        // Links often redirect to a CDN. Relative addresses inside a playlist are resolved
+        // against where it really came from, so keep the final URL of every fetch.
+        let (firstText, firstURL) = try await text(at: source)
+        var mainURL = firstURL
         var mainText = firstText
         var audioURL: URL?
 
         if HLSParser.isMaster(firstText) {
-            let master = try HLSParser.parseMaster(firstText, base: source)
+            let master = try HLSParser.parseMaster(firstText, base: firstURL)
             guard let variant = master.bestVariant() else {
                 throw DownloadFailure("This stream lists no video Veil can save.")
             }
-            mainURL = variant.url
-            mainText = try await text(at: mainURL)
+            (mainText, mainURL) = try await text(at: variant.url)
             audioURL = master.audioRendition(for: variant)?.url
         }
 
@@ -84,8 +85,8 @@ final class HLSDownloader {
 
         var audio: HLSMediaPlaylist?
         if let audioURL {
-            let audioText = try await text(at: audioURL)
-            audio = try HLSParser.parseMedia(audioText, base: audioURL)
+            let (audioText, finalAudioURL) = try await text(at: audioURL)
+            audio = try HLSParser.parseMedia(audioText, base: finalAudioURL)
             if audio?.segments.isEmpty ?? true { audio = nil }
         }
 
@@ -152,7 +153,11 @@ final class HLSDownloader {
             if mainIsPackedAudio {
                 mux.handlePackedAudio(data)
             } else {
-                if mi > 0, main.playlist.segments[mi].discontinuity, audio == nil { mux.markDiscontinuity() }
+                if mi > 0, main.playlist.segments[mi].discontinuity {
+                    mainDemux.flush()  // the old section's last packets come out first
+                    mux.markVideoDiscontinuity()
+                    if audio == nil { mux.markAudioDiscontinuity() }
+                }
                 mainDemux.feed(data)
                 if mainDemux.unsupportedVideo && !mainDemux.foundVideo {
                     throw DownloadFailure("This stream uses HEVC video in a format Veil can't convert yet.")
@@ -169,6 +174,10 @@ final class HLSDownloader {
         func pullAudio() async throws {
             guard let audio else { return }
             let data = try await audio.segment(ai)
+            if ai > 0, audio.playlist.segments[ai].discontinuity {
+                audioDemux.flush()
+                mux.markAudioDiscontinuity()
+            }
             if Self.looksLikeTS(data) { audioDemux.feed(data) } else { mux.handlePackedAudio(data) }
             ai += 1
             if ai == audioCount { audioDemux.flush() }
@@ -209,6 +218,7 @@ final class HLSDownloader {
                 stalls = 0
             case .empty:
                 if !mux.videoActive && !mux.audioActive { break loop }
+                try await Task.sleep(nanoseconds: 2_000_000)
             case .waiting:
                 stalls += 1
                 if stalls > 4000 {
@@ -275,20 +285,28 @@ final class HLSDownloader {
     /// Joins separate video and audio files (or tidies a single fragmented file) into a regular MP4.
     private static func combine(video: URL, audio: URL?, into output: URL) async throws {
         let videoAsset = AVURLAsset(url: video)
-        let composition = AVMutableComposition()
-        let duration = try await videoAsset.load(.duration)
-        let range = CMTimeRange(start: .zero, duration: duration)
-
-        if let track = try await videoAsset.loadTracks(withMediaType: .video).first,
-           let comp = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) {
-            try comp.insertTimeRange(range, of: track, at: .zero)
-            comp.preferredTransform = try await track.load(.preferredTransform)
-        }
         let audioAsset = audio.map { AVURLAsset(url: $0) } ?? videoAsset
-        if let track = try await audioAsset.loadTracks(withMediaType: .audio).first,
+        let composition = AVMutableComposition()
+
+        // Stream segments often don't start at zero. Use each track's real range and line
+        // them up by the earliest start, so audio and video stay in sync.
+        let videoTrack = try await videoAsset.loadTracks(withMediaType: .video).first
+        let audioTrack = try await audioAsset.loadTracks(withMediaType: .audio).first
+        var ranges: [CMTimeRange] = []
+        if let videoTrack { ranges.append(try await videoTrack.load(.timeRange)) }
+        if let audioTrack { ranges.append(try await audioTrack.load(.timeRange)) }
+        guard let earliest = ranges.map(\.start).min() else {
+            throw DownloadFailure("The stream had no video or audio.")
+        }
+
+        if let videoTrack, let range = ranges.first,
+           let comp = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) {
+            try comp.insertTimeRange(range, of: videoTrack, at: range.start - earliest)
+            comp.preferredTransform = try await videoTrack.load(.preferredTransform)
+        }
+        if let audioTrack, let range = ranges.last,
            let comp = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
-            let audioDuration = try await audioAsset.load(.duration)
-            try comp.insertTimeRange(CMTimeRange(start: .zero, duration: min(duration, audioDuration)), of: track, at: .zero)
+            try comp.insertTimeRange(range, of: audioTrack, at: range.start - earliest)
         }
 
         for preset in [AVAssetExportPresetPassthrough, AVAssetExportPresetHighestQuality] {
@@ -306,15 +324,20 @@ final class HLSDownloader {
 
     // MARK: Network
 
-    func text(at url: URL) async throws -> String {
-        let data = try await data(at: url, range: nil)
+    /// Returns the playlist text and the URL it finally came from.
+    func text(at url: URL) async throws -> (String, URL) {
+        let (data, finalURL) = try await fetch(url, range: nil)
         guard let text = String(data: data, encoding: .utf8), text.contains("#EXTM3U") else {
             throw DownloadFailure("The stream's playlist couldn't be read. The link may have expired. Reload the page and try again.")
         }
-        return text
+        return (text, finalURL)
     }
 
     func data(at url: URL, range: ByteRange?) async throws -> Data {
+        try await fetch(url, range: range).0
+    }
+
+    private func fetch(_ url: URL, range: ByteRange?) async throws -> (Data, URL) {
         var request = URLRequest(url: url)
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
         for (key, value) in CookieHeader.fields(for: url, from: cookies) { request.setValue(value, forHTTPHeaderField: key) }
@@ -325,10 +348,16 @@ final class HLSDownloader {
             try Task.checkCancellation()
             do {
                 let (data, response) = try await session.data(for: request)
-                guard let http = response as? HTTPURLResponse else { return data }
+                let finalURL = response.url ?? url
+                guard let http = response as? HTTPURLResponse else { return (data, finalURL) }
                 switch http.statusCode {
                 case 200..<300:
-                    return data
+                    // Some servers ignore Range and send the whole file. Cut out the part asked for.
+                    if let range, http.statusCode == 200, data.count > range.length, data.count > range.offset {
+                        let end = min(data.count, range.offset + range.length)
+                        return (data.subdata(in: range.offset..<end), finalURL)
+                    }
+                    return (data, finalURL)
                 case 401, 403:
                     throw DownloadFailure("The site refused access (error \(http.statusCode)). Play the video in Veil first, then try again.")
                 case 404, 410:

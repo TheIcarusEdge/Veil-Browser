@@ -133,9 +133,16 @@ enum HLSParser {
                 }
             } else if line.hasPrefix("#EXT-X-MAP:") {
                 let attrs = attributes(after: line)
-                if result.initSegment == nil, let uri = attrs["URI"], let url = URL(string: uri, relativeTo: base)?.absoluteURL {
+                if let uri = attrs["URI"], let url = URL(string: uri, relativeTo: base)?.absoluteURL {
                     let mapRange = attrs["BYTERANGE"].flatMap { parseRange($0, previousEnd: 0) }
-                    result.initSegment = (url, mapRange)
+                    if let existing = result.initSegment {
+                        // A second, different init segment means sections that can't be joined into one file.
+                        if existing.url != url || existing.range != mapRange {
+                            throw DownloadFailure("This stream switches formats partway through, which Veil can't join into one file yet.")
+                        }
+                    } else {
+                        result.initSegment = (url, mapRange)
+                    }
                 }
             } else if line.hasPrefix("#EXT-X-BYTERANGE:") {
                 range = parseRange(String(line.dropFirst("#EXT-X-BYTERANGE:".count)), previousEnd: nil)
